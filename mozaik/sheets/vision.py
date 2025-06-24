@@ -244,8 +244,21 @@ class VisualCorticalUniformSheet3D(VisualCorticalUniformSheet):
                                    rng=mozaik.pynn_rng)
 
         if self.parameters.cell.native_nest:
+            # Hack to use NESTML models with tsodyks_synapse
+            from pyNN.standardmodels.base import build_translations
+            celltype = self.sim.native_cell_type(self.parameters.cell.model)
+            celltype.translations = build_translations(
+                ('tau_syn_E',  'tau_syn_exc'),
+                ('tau_syn_I',  'tau_syn_inh'),
+            )
+            celltype.units['w'] = "pA"
+            celltype.units['v'] = "mV"
+            celltype.units['gsyn_exc'] = "nS"
+            celltype.units['gsyn_inh'] = "nS"
+            print(celltype.recordable)
+            print(celltype.units)
             self.pop = self.sim.Population(int(parameters.sx * parameters.sy/1000000 * parameters.density),
-                                               self.sim.native_cell_type(self.parameters.cell.model),
+                                               celltype,
                                                self.parameters.cell.params,
                                                structure=rs,
                                                initial_values=self.parameters.cell.initial_values,

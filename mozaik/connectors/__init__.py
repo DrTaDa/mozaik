@@ -24,12 +24,7 @@ class Connector(BaseComponent):
     """
     required_parameters = ParameterSet({
             'target_synapses' : str,
-            'short_term_plasticity': ParameterSet({
-                    'U': float, 
-                    'tau_rec': float, 
-                    'tau_fac': float,
-                    'tau_psc': float
-            }),
+            'short_term_plasticity': ParameterSet
     })
     
     def __init__(self, model, name, source, target, parameters):

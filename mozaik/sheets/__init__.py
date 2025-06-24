@@ -262,14 +262,14 @@ class Sheet(BaseComponent):
                 try:
                     if self.parameters.cell.native_nest:
                         if i + steps < len(self.pop):
-                            b = self.pop[i:i+steps].get_data(['spikes', 'V_m', 'g_ex', 'g_in'],clear=False)
+                            b = self.pop[i:i+steps].get_data(['spikes', 'v', 'g_exc', 'g_inh'],clear=False)
                         else:
-                            b = self.pop[i:i+steps].get_data(['spikes', 'V_m', 'g_ex', 'g_in'],clear=True)
+                            b = self.pop[i:i+steps].get_data(['spikes', 'v', 'g_exc', 'g_inh'],clear=True)
                     else:
                         if i + steps < len(self.pop):
-                            b = self.pop[i:i+steps].get_data(['spikes', 'v', 'gsyn_exc', 'gsyn_inh'],clear=False)
+                            b = self.pop[i:i+steps].get_data(['spikes', 'v', 'g_exc', 'g_inh'],clear=False)
                         else:
-                            b = self.pop[i:i+steps].get_data(['spikes', 'v', 'gsyn_exc', 'gsyn_inh'],clear=True)
+                            b = self.pop[i:i+steps].get_data(['spikes', 'v', 'g_exc', 'g_inh'],clear=True)
                 except (NothingToWriteError, errmsg):
                     logger.debug(errmsg)
                 if (mozaik.mpi_comm) and (mozaik.mpi_comm.rank == mozaik.MPI_ROOT):
@@ -289,9 +289,9 @@ class Sheet(BaseComponent):
         else:
             try:
                 if self.parameters.cell.native_nest:
-                    block = self.pop.get_data(['spikes', 'V_m', 'g_ex', 'g_in'],clear=True)
+                    block = self.pop.get_data(['spikes', 'v', 'g_exc', 'g_inh'],clear=True)
                 else:
-                    block = self.pop.get_data(['spikes', 'v', 'gsyn_exc', 'gsyn_inh'],clear=True)
+                    block = self.pop.get_data(['spikes', 'v', 'g_exc', 'g_inh'],clear=True)
             except (NothingToWriteError, errmsg):
                 logger.debug(errmsg)
 
