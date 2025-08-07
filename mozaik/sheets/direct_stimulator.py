@@ -1033,6 +1033,9 @@ def single_pixel(sheet, coor_x, coor_y, update_interval, parameters):
     return signals
 
 
+
+
+
 class IntraCorticalMicroStimulation(DirectStimulator):
     """
     This class instantiates a multi-electrode array using the
@@ -1064,6 +1067,12 @@ class IntraCorticalMicroStimulation(DirectStimulator):
         """Init"""
         DirectStimulator.__init__(self, sheet, parameters)
 
+
+        #variable to store a copy of the 'animation slides', or the ICMS_active_electrodes_array
+        self.ICMS_active_electrodes_array = self.parameters.probe_active_electrodes
+        self.num_slides = len(self.ICMS_active_electrodes_array)
+        self.current_slide = 0 #for console logging purposes
+
         # ICMS specific random generator. This is used to make sure that the same cells
         # are selected to be stimulated between runs that use the same electrode(s) and amplitude.
         self.rng = numpy.random.default_rng(self.parameters.stimulator_seed)
@@ -1074,6 +1083,7 @@ class IntraCorticalMicroStimulation(DirectStimulator):
 
         self.instantiate_probe()
         self.select_stimulated_cells()
+
 
     def instantiate_probe(self):
         """Instantiate a probe based on its description. Please refer to
@@ -1139,7 +1149,7 @@ class IntraCorticalMicroStimulation(DirectStimulator):
             numpy.inf
         ))
 
-        # This calculates the probability P(activate | distance, current_amplitude)
+       # This calculates the probability P(activate | distance, current_amplitude)
         scaled_probabilities = self.activation_distribution[1][_idx_distribution] * recruitment_rescale
 
         # Compare the fixed random score with the amplitude-dependent probability
@@ -1148,7 +1158,7 @@ class IntraCorticalMicroStimulation(DirectStimulator):
 
         # Only keep the active electrodes
         for j in range(n_electrodes):
-            if j not in self.parameters.probe_active_electrodes:
+            if j not in self.ICMS_active_electrodes_array[0][1]:
                 _mask[:, j] = False
 
         # Build the dictionary of stimulated cells
@@ -1176,20 +1186,50 @@ class IntraCorticalMicroStimulation(DirectStimulator):
 
         offset : double (seconds)
                The current simulator time.
+
+
+        Returns
+        ---------
+
+        do_slides_remain : boolean
+                If there are remaining "slides", a way to represent if there are more sections of the electrode activation array left. Returns True if here is more than 1 element in the probe_active_electrodes array, and false if 1.
+
+
         """
         ICMS_ISI = 1000. / self.parameters.frequency
-        ISIs = []
-        for cell_id in self.sheet.pop.all_cells:
+
+        #creates array of all cells with frequency=0
+        ISIs = numpy.zeros(len(self.sheet.pop.all_cells))
+        #sets frequency=ICMS_ISI for all stimulated cells
+        for i, cell_id in enumerate(self.sheet.pop.all_cells):
             if cell_id in self.stimulated_cells:
-                ISIs.append(ICMS_ISI)
-            else:
-                # An stimulation ISI of 0 means no ICMS-induced spikes
-                ISIs.append(0)
+                ISIs[i] = ICMS_ISI
+
 
         self.sheet.pop.set(microstimulation_ISI=ISIs)
         logger.info(
-            f"ICMS: starting stimulation at frequency {self.parameters.frequency}Hz (ISI of {ICMS_ISI}ms)."
+            f"ICMS: starting stimulation slide {self.current_slide}/{self.num_slides} at frequency {self.parameters.frequency}Hz (ISI of {ICMS_ISI}ms)."
         )
+
+        #checking if slides remain
+        self.do_slides_remain = len(self.ICMS_active_electrodes_array) > 1
+
+        return self.do_slides_remain
+
+    def transition(self):
+
+        """
+        Transitions between different time periods ("slides") of the stimulus. In other words: Activates the next set of electrodes.
+
+        Called in mozaik/models/__init.py__ when there are slides remaining in the ICMS_active_electrodes_array
+
+        """
+
+
+        #removing the first element of ICMS_active_electrodes_array to make room for the next frame
+        self.ICMS_active_electrodes_array.pop(0)
+
+        self.current_slide += 1 #for console log
 
     def inactivate(self, offset):
         """
@@ -1209,25 +1249,28 @@ class IntraCorticalMicroStimulation(DirectStimulator):
     def save_to_datastore(self, data_store, stimulus):
         """Stores the electrode positions and the list of cells activated by each electrode"""
 
-        active_electrode = '_'.join(str(e) for e in self.parameters.probe_active_electrodes)
-        metadata = f"__{self.parameters.amplitude}__{self.parameters.frequency}__{active_electrode}"
+        for slide in self.ICMS_active_electrodes_array:
+            active_electrode = '_'.join(str(e) for e in slide[1])
+            metadata = f"__{self.parameters.amplitude}__{self.parameters.frequency}__{active_electrode}"
 
-        electrode_per_cell = [list(el)[0] for el in self.stimulated_cells.values()]
-        data_store.full_datastore.add_analysis_result(
-            PerNeuronValue(
-                values=electrode_per_cell,
-                idds=[int(idd) for idd in self.stimulated_cells.keys()],
-                value_name='electrode_active_per_cell' + metadata,
-                sheet_name=self.sheet.name,
-                value_units="None"
+            electrode_per_cell = [list(el)[0] for el in self.stimulated_cells.values()]
+            data_store.full_datastore.add_analysis_result(
+                PerNeuronValue(
+                    values=electrode_per_cell,
+                    idds=[int(idd) for idd in self.stimulated_cells.keys()],
+                    value_name='electrode_active_per_cell' + metadata,
+                    sheet_name=self.sheet.name,
+                    value_units="None"
+                )
             )
-        )
 
-        data_store.full_datastore.add_analysis_result(
-            SingleValueList(
-                values=self.probe.contact_positions,
-                values_unit='um',
-                value_name='probe_electrode_positions' + metadata,
-                sheet_name=self.sheet.name
-            )
-        )
+            data_store.full_datastore.add_analysis_result(
+                SingleValueList(
+                    values=self.probe.contact_positions,
+                    values_unit='um',
+                    value_name='probe_electrode_positions' + metadata,
+                    sheet_name=self.sheet.name
+                )
+                )
+
+
