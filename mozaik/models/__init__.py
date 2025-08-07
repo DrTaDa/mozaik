@@ -110,84 +110,114 @@ class Model(BaseComponent):
     def present_stimulus_and_record(self, stimulus,artificial_stimulators):
         """
         This method is the core of the model execution control. It ensures that a `stimulus` is presented
-        to the model, the simulation is ran for the duration of the stimulus, and all the data recorded during 
+        to the model, the simulation is ran for the duration of the stimulus, and all the data recorded during
         this period are retieved from the simulator. It also makes sure a blank stimulus preceds each stimulus presntation.
-        
+        If there are multiple stimuli at different times, (indicated by "self.do_slides_remain") then the method iterates through all of those 'slides'.
+
+
         Parameters
         ----------
         stimulus : Stimulus
                  Stimulus to be presented.
-                 
+
         artificial_stimulators : dict
                                Dictionary where keys are sheet names, and values are lists of DirectStimulator instances to be applied in the corresponding sheet.
-        
+
         Returns
         -------
         segments : list
                  List of segments holding the recorded data, one per each sheet.
-        
+
         sensory_input : object
                  The 'raw' sensory input that has been shown to the network - the structure of this object depends on the sensory component.
-        
+
         sim_run_time : float (seconds)
                      The biological time of the simulation up to this point (including blank presentations).
-                                          
+
         """
         t0 = time.time()
         for sheet in self.sheets.values():
             if self.first_time:
                sheet.record()
         null_segments,sim_run_time = self.reset()
-        
-        for sheet in self.sheets.values():
-            sheet.prepare_artificial_stimulation(stimulus.duration,self.simulator_time,artificial_stimulators.get(sheet.name,[]))
-        if self.input_space:
-            self.input_space.clear()
-            if not isinstance(stimulus,InternalStimulus):
-                self.input_space.add_object(str(stimulus), stimulus)
-                sensory_input = self.input_layer.process_input(self.input_space, stimulus, stimulus.duration, self.simulator_time)
-            else:
-                self.input_layer.provide_null_input(self.input_space,stimulus.duration,self.simulator_time)
-                sensory_input = None                                                    
-        else:
-            sensory_input = None
 
-        sim_run_time += self.run(stimulus.duration)
         segments = []
-        
-        for sheet in self.sheets.values():    
-            if sheet.to_record != None:
-                if self.parameters.reset:
-                    s = sheet.get_data()
-                    if (not mozaik.mpi_comm) or (mozaik.mpi_comm.rank == mozaik.MPI_ROOT):
-                        segments.append(s)
-                else:
-                    s = sheet.get_data(stimulus.duration)
-                    if (not mozaik.mpi_comm) or (mozaik.mpi_comm.rank == mozaik.MPI_ROOT):
-                        segments.append(s)
 
-        self.first_time = False
+        while True: #breaks out if do_slides_remain is False
 
-        exploded = False
-        if mozaik.mpi_comm.rank == mozaik.MPI_ROOT:
+            #initializes do_slides_remain, and the array that checks through all of the sheets
+            self.do_slides_remain = False
+            self.do_slides_remain_array = []
+
             for sheet in self.sheets.values():
-                msc = sheet.mean_spike_count()
-                logger.info("Sheet %s average rate: %f" % (sheet.name,msc))
-                if (self.parameters.explosion_monitoring and sheet.name == self.parameters.explosion_monitoring.sheet_name and 
-                        msc > self.parameters.explosion_monitoring.threshold):
-                    logger.info(f'The activity in {sheet.name} is too high, the datastore will be saved and the simulation will be terminated')
-                    exploded = True
-        if mozaik.mpi_comm:
-            exploded = mozaik.mpi_comm.bcast(exploded, root=mozaik.MPI_ROOT)
-        
-        #remove any artificial stimulators 
+                #runs prepare_artificial_stimulation() from mozaik/sheets/__init__.py and returns if slides remain
+                self.do_slides_remain_return = sheet.prepare_artificial_stimulation(stimulus.duration,self.simulator_time,artificial_stimulators.get(sheet.name,[]))
+                self.do_slides_remain_array.append(self.do_slides_remain_return) #if slides remain within this sheet, add to the array
+
+            if self.input_space:
+                self.input_space.clear()
+                if not isinstance(stimulus,InternalStimulus):
+                    self.input_space.add_object(str(stimulus), stimulus)
+                    sensory_input = self.input_layer.process_input(self.input_space, stimulus, stimulus.duration, self.simulator_time)
+                else:
+                    self.input_layer.provide_null_input(self.input_space,stimulus.duration,self.simulator_time)
+                    sensory_input = None
+            else:
+                sensory_input = None
+
+            sim_run_time += self.run(stimulus.duration)
+
+            for sheet in self.sheets.values():
+                if sheet.to_record != None:
+                    if self.parameters.reset:
+                        s = sheet.get_data()
+                        if (not mozaik.mpi_comm) or (mozaik.mpi_comm.rank == mozaik.MPI_ROOT):
+                            segments.append(s)
+                    else:
+                        s = sheet.get_data(stimulus.duration)
+                        if (not mozaik.mpi_comm) or (mozaik.mpi_comm.rank == mozaik.MPI_ROOT):
+                            segments.append(s)
+
+            self.first_time = False
+
+            exploded = False
+            if mozaik.mpi_comm.rank == mozaik.MPI_ROOT:
+                for sheet in self.sheets.values():
+                    msc = sheet.mean_spike_count()
+                    logger.info("Sheet %s average rate: %f" % (sheet.name,msc))
+                    if (self.parameters.explosion_monitoring and sheet.name == self.parameters.explosion_monitoring.sheet_name and
+                            msc > self.parameters.explosion_monitoring.threshold):
+                        logger.info(f'The activity in {sheet.name} is too high, the datastore will be saved and the simulation will be terminated')
+                        exploded = True
+            if mozaik.mpi_comm:
+                exploded = mozaik.mpi_comm.bcast(exploded, root=mozaik.MPI_ROOT)
+
+           #if slides remain within ANY sheet, do_slides_remain set to true
+            for i in self.do_slides_remain_array:
+                if i == True:
+                    self.do_slides_remain = True
+
+            #if no slides remain, break from the loop
+            if self.do_slides_remain == False:
+                break
+
+            #if slides still remain, transition each of the stimulators
+            for sheet in self.sheets.values():
+                for ds in artificial_stimulators.get(sheet.name,[]):
+                    ds.transition()
+
+            '''END OF THE WHILE LOOP (breaks out if no slides remain)'''
+
+
+        #remove any artificial stimulators at the end of the experiment
         for sheet in self.sheets.values():
             for ds in artificial_stimulators.get(sheet.name,[]):
                 ds.inactivate(self.simulator_time)
-        
+
         logger.info("Stimulus presentation took %.0f s, of which %.0f s was simulation time"  % (time.time() - t0,sim_run_time))
 
         return (segments, null_segments,sensory_input,sim_run_time,exploded)
+
         
     def run(self, tstop):
         """
