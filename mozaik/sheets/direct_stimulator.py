@@ -1068,9 +1068,9 @@ class IntraCorticalMicroStimulation(DirectStimulator):
         DirectStimulator.__init__(self, sheet, parameters)
 
 
-        #variable to store a copy of the 'animation slides', or the ICMS_active_electrodes_array
-        self.ICMS_active_electrodes_array = self.parameters.probe_active_electrodes
-        self.num_slides = len(self.ICMS_active_electrodes_array)
+        #variable to store a copy of the 'animation slides', or the ICMS_active_electrodes
+        self.ICMS_active_electrodes = self.parameters.probe_active_electrodes
+        self.num_slides = len(self.ICMS_active_electrodes)
         self.current_slide = 0 #for console logging purposes
 
         # ICMS specific random generator. This is used to make sure that the same cells
@@ -1158,7 +1158,7 @@ class IntraCorticalMicroStimulation(DirectStimulator):
 
         # Only keep the active electrodes
         for j in range(n_electrodes):
-            if j not in self.ICMS_active_electrodes_array[0][1]:
+            if j not in self.ICMS_active_electrodes[0][1]:
                 _mask[:, j] = False
 
         # Build the dictionary of stimulated cells
@@ -1212,7 +1212,7 @@ class IntraCorticalMicroStimulation(DirectStimulator):
         )
 
         #checking if slides remain
-        self.do_slides_remain = len(self.ICMS_active_electrodes_array) > 1
+        self.do_slides_remain = len(self.ICMS_active_electrodes) > 1
 
         return self.do_slides_remain
 
@@ -1221,13 +1221,13 @@ class IntraCorticalMicroStimulation(DirectStimulator):
         """
         Transitions between different time periods ("slides") of the stimulus. In other words: Activates the next set of electrodes.
 
-        Called in mozaik/models/__init.py__ when there are slides remaining in the ICMS_active_electrodes_array
+        Called in mozaik/models/__init.py__ when there are slides remaining in the ICMS_active_electrodes
 
         """
 
 
-        #removing the first element of ICMS_active_electrodes_array to make room for the next frame
-        self.ICMS_active_electrodes_array.pop(0)
+        #removing the first element of ICMS_active_electrodes to make room for the next frame
+        self.ICMS_active_electrodes.pop(0)
 
         self.current_slide += 1 #for console log
 
@@ -1249,7 +1249,7 @@ class IntraCorticalMicroStimulation(DirectStimulator):
     def save_to_datastore(self, data_store, stimulus):
         """Stores the electrode positions and the list of cells activated by each electrode"""
 
-        for slide in self.ICMS_active_electrodes_array:
+        for slide in self.ICMS_active_electrodes:
             active_electrode = '_'.join(str(e) for e in slide[1])
             metadata = f"__{self.parameters.amplitude}__{self.parameters.frequency}__{active_electrode}"
 

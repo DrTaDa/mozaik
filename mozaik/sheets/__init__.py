@@ -343,24 +343,20 @@ class Sheet(BaseComponent):
         Returns
         ---------
 
-        do_slides_remain : boolean
+        slides_remain : boolean
                 If there are remaining "slides", a way to represent if there are more sections of the electrode activation array left. Returns True if here is more than 1 element in the probe_active_electrodes array, and false if 1.
 
 
         """
-        self.do_slides_remain_array = []
+        self.slides_remain = False
 
         for ds in self.artificial_stimulators + additional_stimulators:
             #runs prepare_stimulation from sheets/direct_stimulation
-            self.do_slides_remain_return = ds.prepare_stimulation(duration,offset)
-            self.do_slides_remain_array.append(self.do_slides_remain_return)
+            self.slides_remain_return = ds.prepare_stimulation(duration,offset)
+            if self.slides_remain_return == True:
+                self.slides_remain = True
 
-        if self.do_slides_remain_array != []:
-            self.do_slides_remain = False
-            for i in self.do_slides_remain_array:
-                if i == True:
-                    self.do_slides_remain = True
-            return self.do_slides_remain
+        return self.slides_remain
 
     def setup_artificial_stimulation(self):
         """

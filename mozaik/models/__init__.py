@@ -110,9 +110,8 @@ class Model(BaseComponent):
     def present_stimulus_and_record(self, stimulus,artificial_stimulators):
         """
         This method is the core of the model execution control. It ensures that a `stimulus` is presented
-        to the model, the simulation is ran for the duration of the stimulus, and all the data recorded during
-        this period are retieved from the simulator. It also makes sure a blank stimulus preceds each stimulus presntation.
-        If there are multiple stimuli at different times, (indicated by "self.do_slides_remain") then the method iterates through all of those 'slides'.
+        to the model, the simulation is ran for the duration of the stimulus, and all the data recorded during this period are retieved from the simulator. It also makes sure a blank stimulus preceds each stimulus presntation.
+        If there are multiple stimuli at different times, (indicated by "slides_remain") then the method iterates through all of those 'slides'.
 
 
         Parameters
@@ -143,17 +142,17 @@ class Model(BaseComponent):
 
         segments = []
 
-        while True: #breaks out if do_slides_remain is False
+        while True: #breaks out if slides_remain is False
 
-            #initializes do_slides_remain, and the array that checks through all of the sheets
-            self.do_slides_remain = False
-            self.do_slides_remain_array = []
+            #initializing slides_remain, to be changed by the next for loop that runs prepare_artificial_stimulation for all the sheets.
+            slides_remain = False
 
             for sheet in self.sheets.values():
                 #runs prepare_artificial_stimulation() from mozaik/sheets/__init__.py and returns if slides remain
-                self.do_slides_remain_return = sheet.prepare_artificial_stimulation(stimulus.duration,self.simulator_time,artificial_stimulators.get(sheet.name,[]))
-                self.do_slides_remain_array.append(self.do_slides_remain_return) #if slides remain within this sheet, add to the array
-
+                self.slides_remain_return = sheet.prepare_artificial_stimulation(stimulus.duration,self.simulator_time,artificial_stimulators.get(sheet.name,[]))
+                if self.slides_remain_return == True:
+                    slides_remain = True
+            
             if self.input_space:
                 self.input_space.clear()
                 if not isinstance(stimulus,InternalStimulus):
@@ -192,13 +191,8 @@ class Model(BaseComponent):
             if mozaik.mpi_comm:
                 exploded = mozaik.mpi_comm.bcast(exploded, root=mozaik.MPI_ROOT)
 
-           #if slides remain within ANY sheet, do_slides_remain set to true
-            for i in self.do_slides_remain_array:
-                if i == True:
-                    self.do_slides_remain = True
-
             #if no slides remain, break from the loop
-            if self.do_slides_remain == False:
+            if slides_remain == False:
                 break
 
             #if slides still remain, transition each of the stimulators
