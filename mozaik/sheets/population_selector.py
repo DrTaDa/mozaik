@@ -106,6 +106,24 @@ class RCRandomPercentage(PopulationSelector):
           return z[:int(len(z)*self.parameters.percentage/100)]
 
           
+def _closest_neurons(px, py, xx, yy, candidates=8):
+    r"""
+    For each point (xx[i], yy[i]) returns the index of the closest neuron, i.e. the same as
+    numpy.argmin(numpy.power(px - xx[i],2) + numpy.power(py - yy[i],2)) (including tie
+    breaking towards the lowest index), using a k-d tree to preselect candidates.
+    """
+    from scipy.spatial import cKDTree
+    xx = numpy.asarray(xx, dtype=float)
+    yy = numpy.asarray(yy, dtype=float)
+    k = min(candidates, len(px))
+    _, idx = cKDTree(numpy.column_stack((px, py))).query(numpy.column_stack((xx, yy)), k=k)
+    idx = numpy.asarray(idx).reshape(len(xx), k)
+    # exact distances (same expression as above) of the candidates, sorted by index for tie breaking
+    idx = numpy.sort(idx, axis=1)
+    d = numpy.power(px[idx] - xx[:, None],2) + numpy.power(py[idx] - yy[:, None],2)
+    return idx[numpy.arange(len(xx)), numpy.argmin(d, axis=1)]
+
+
 class RCGrid(PopulationSelector):
       r"""
       Select neurons on a grid.
@@ -142,12 +160,12 @@ class RCGrid(PopulationSelector):
       def generate_idd_list_of_neurons(self):
           assert math.fmod(self.parameters.size,self.parameters.spacing) < 0.000000001 , "Error the size has to be multiple of spacing!"
           
-          picked = []
           z = self.sheet.pop.all_cells.astype(int)
-          for x in self.parameters.offset_x + numpy.arange(0,self.parameters.size,self.parameters.spacing) - self.parameters.size/2.0:
-              for y in self.parameters.offset_y + numpy.arange(0,self.parameters.size,self.parameters.spacing) - self.parameters.size/2.0:
-                  xx,yy = self.sheet.cs_2_vf(x,y)
-                  picked.append(z[numpy.argmin(numpy.power(self.sheet.pop.positions[0] - xx,2) +  numpy.power(self.sheet.pop.positions[1] - yy,2))])
+          xs = self.parameters.offset_x + numpy.arange(0,self.parameters.size,self.parameters.spacing) - self.parameters.size/2.0
+          ys = self.parameters.offset_y + numpy.arange(0,self.parameters.size,self.parameters.spacing) - self.parameters.size/2.0
+          # grid points in the same order as two nested loops over xs (outer) and ys (inner)
+          xx, yy = self.sheet.cs_2_vf(numpy.repeat(xs, len(ys)), numpy.tile(ys, len(xs)))
+          picked = z[_closest_neurons(self.sheet.pop.positions[0], self.sheet.pop.positions[1], xx, yy)].tolist()
           
           logger.info("RCGrid> picked neurons: " + str(picked))
           return list(set(picked))

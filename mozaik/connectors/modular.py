@@ -3,6 +3,7 @@ import mozaik
 import numpy
 import ast
 from mozaik.connectors import Connector
+from mozaik.connectors.array_connector import ArrayConnector
 from mozaik.connectors.modular_connector_functions import *
 from collections import Counter
 from parameters import ParameterSet
@@ -17,6 +18,15 @@ from builtins import zip
 logger = mozaik.getMozaikLogger()
 
 
+def _seeded_draw(distribution, seed, n):
+    r"""
+    Same as distribution.copy(seed).next(n), using the faster PyNNDistribution.seeded_next when available.
+    """
+    if hasattr(distribution, 'seeded_next'):
+        return distribution.seeded_next(seed, n)
+    return distribution.copy(seed).next(n)
+
+
 def _lognormal_event_weight_sums(base_weight_distribution, sigma, counts, seed):
     counts = numpy.array(counts, dtype=int)
     if numpy.any(counts < 0):
@@ -26,7 +36,7 @@ def _lognormal_event_weight_sums(base_weight_distribution, sigma, counts, seed):
     if total_count == 0:
         return numpy.array([])
 
-    base_weights = base_weight_distribution.copy(seed).next(total_count)
+    base_weights = _seeded_draw(base_weight_distribution, seed, total_count)
     mu = -0.5 * sigma * sigma
     rng_seed = (int(seed) + 7919) % (2**32)
     rng = numpy.random.RandomState(rng_seed)
@@ -104,23 +114,30 @@ class ModularConnector(Connector):
       for k in self.delay_function_names:
           self.delay_functions[k] = load_component(self.parameters.delay_functions[k].component)(self.source,self.target,self.parameters.delay_functions[k].params)
 
+      self._weight_expression = compile(self.parameters.weight_expression, '<weight_expression>', 'eval')
+      self._delay_expression = compile(self.parameters.delay_expression, '<delay_expression>', 'eval')
+      # If all delay functions can be evaluated for a subset of the source neurons (and do not
+      # draw from shared random number generators), delays are only computed for the sources that
+      # actually get connected.
+      self._delays_on_subset = all(getattr(f, "subset_evaluation_safe", False) for f in self.delay_functions.values())
+
     def _obtain_weights(self,i,seed=None):
         r"""
         This function calculates the combined weights from the ModularConnectorFunction in weight_functions
         """
         evaled = OrderedDict()
-       
+
         for k in self.weight_function_names:
             evaled[k] = (
                 self.weight_functions[k].evaluate(i)
                 if seed is None
                 else self.weight_functions[k].evaluate(i, seed=seed)
             )
-        weights = numpy.zeros((self.source.pop.size,)) + eval(self.parameters.weight_expression,globals(),evaled)
+        weights = numpy.zeros((self.source.pop.size,)) + eval(self._weight_expression,globals(),evaled)
         if not self.parameters.self_connections and self.target.name == self.source.name:
             weights[i] = 0
         return weights
-        
+
     def _obtain_delays(self,i,seed=None):
         r"""
         This function calculates the combined weights from the ModularConnectorFunction in weight_functions
@@ -132,11 +149,28 @@ class ModularConnector(Connector):
                 if seed is None
                 else self.delay_functions[k].evaluate(i, seed=seed)
             )
-        
-        delays = numpy.zeros((self.source.pop.size,)) + eval(self.parameters.delay_expression,globals(),evaled)
+
+        delays = numpy.zeros((self.source.pop.size,)) + eval(self._delay_expression,globals(),evaled)
         delays = numpy.rint(delays / self.simulator_time_step) * self.simulator_time_step
         return delays
-        
+
+    def _obtain_delays_subset(self,i,source_indices,seed=None):
+        r"""
+        Same as _obtain_delays(i,seed)[source_indices], computed only for the given source neurons.
+        Only valid if self._delays_on_subset is True.
+        """
+        evaled = OrderedDict()
+        for k in self.delay_function_names:
+            evaled[k] = (
+                self.delay_functions[k].evaluate_subset(i, source_indices)
+                if seed is None
+                else self.delay_functions[k].evaluate_subset(i, source_indices, seed=seed)
+            )
+
+        delays = numpy.zeros((len(source_indices),)) + eval(self._delay_expression,globals(),evaled)
+        delays = numpy.rint(delays / self.simulator_time_step) * self.simulator_time_step
+        return delays
+
     def _connect(self):
         connection_list = []
         z = numpy.zeros((self.target.pop.size,))
@@ -285,6 +319,112 @@ class VariableNumSamplesConnector(LocalModuleConnector):
         else:
             return samples
 
+
+    def _connect_by_sampling(self, num_samples):
+        r"""
+        Realizes the connections of the sampling connectors.
+
+        For each local target neuron, the weights over all source neurons are
+        interpreted as proportional connection probabilities, `num_samples(index)`
+        connections are sampled from them, and repeated samples of the same source
+        are merged into a single synapse whose weight is the sum of the sampled
+        synaptic weights. The work is split over `num_threads` forked worker processes.
+
+        num_samples : func
+            Called with the index of the target neuron, at the point of the
+            computation where the original implementation determined the number
+            of samples (it may draw from the shared random number generators).
+        """
+        local_indices = numpy.nonzero(self.target.pop._mask_local)[0]
+        seeds = mozaik.get_model_seeds(len(self.target.pop))[local_indices]
+        splitted_seeds = numpy.array_split(seeds, int(self.model.num_threads))
+        splitted_cell_indices = numpy.array_split(local_indices, int(self.model.num_threads))
+
+        import multiprocessing
+
+        # This code will be ran by each subprocess
+        def build_connector(indices, seeds, queue):
+            queue.put(self._sampled_connections(indices, seeds, num_samples))
+
+        processes = []
+        queues = []
+        for i in range(len(splitted_cell_indices)):
+            queues.append(multiprocessing.Queue())
+            proc = multiprocessing.Process(
+                target=build_connector,
+                args=(splitted_cell_indices[i], splitted_seeds[i], queues[i]),
+            )
+            proc.start()
+            processes.append(proc)
+
+        # Gather the output of each subprocess. Each one handles a contiguous, increasing
+        # range of targets, so the concatenated connections are sorted by target and then source.
+        results = []
+        v = 0
+        for i, p in enumerate(processes):
+            res = queues[i].get()
+            results.append(res[:4])
+            v += res[4]
+            p.join()
+        pre, post, weights, delays = [numpy.concatenate(c) for c in zip(*results)]
+        del results
+
+        logger.warning("%s(%s): %g connections were created, %g per target neuron [%g]" % (self.name,self.__class__.__name__,len(pre),len(pre)/len(local_indices),v/len(local_indices)))
+
+        if len(pre) > 0:
+            self.proj = self.sim.Projection(
+                                self.source.pop,
+                                self.target.pop,
+                                ArrayConnector(pre, post, weights, delays),
+                                synapse_type=self.init_synaptic_mechanisms(),
+                                label=self.name,
+                                receptor_type=self.parameters.target_synapses)
+        else:
+            logger.warning("%s(%s): empty projection - pyNN projection not created." % (self.name,self.__class__.__name__))
+
+    def _sampled_connections(self, indices, seeds, num_samples):
+        r"""
+        Computes the connections onto the target neurons `indices`, see _connect_by_sampling.
+        Returns arrays of source indices, target indices, weights and delays (sorted by
+        target and then source) and the total number of samples.
+        """
+        pre, post, weights_list, delays_list = [], [], [], []
+        total_samples = 0
+        for index, seed in zip(indices, seeds):
+            weights = self._obtain_weights(index, seed)
+
+            # If a local module is defined, update the weights accordingly
+            if self.parameters.local_module:
+                weights = self.local_module_weight_updates(index, weights)
+
+            if not self._delays_on_subset:
+                delays = self._obtain_delays(index, seed)
+
+            samples = sample_from_bin_distribution(weights, int(num_samples(index)), seed)
+            if len(samples) == 0:
+                continue
+            total_samples += len(samples)
+
+            sources, first_occurrence, counts = numpy.unique(samples, return_index=True, return_counts=True)
+            # synaptic weights are drawn for the sources in order of their first occurrence in the sample
+            order = numpy.argsort(first_occurrence, kind='stable')
+            w = numpy.empty(len(sources))
+            w[order] = self.weight_scaler * self._sample_connection_weights(counts[order], seed)
+
+            pre.append(sources)
+            post.append(numpy.full(len(sources), index))
+            weights_list.append(w)
+            if self._delays_on_subset:
+                delays_list.append(self._obtain_delays_subset(index, sources, seed))
+            else:
+                delays_list.append(numpy.array(delays)[sources])
+
+        if len(pre) == 0:
+            return (numpy.zeros(0, dtype=numpy.int32), numpy.zeros(0, dtype=numpy.int32),
+                    numpy.zeros(0), numpy.zeros(0), 0)
+        return (numpy.concatenate(pre).astype(numpy.int32), numpy.concatenate(post).astype(numpy.int32),
+                numpy.concatenate(weights_list), numpy.concatenate(delays_list), total_samples)
+
 class ModularSamplingProbabilisticConnector(VariableNumSamplesConnector):
     r"""
     VariableNumSampleConnector that interprets the weights as proportional probabilities of connectivity
@@ -306,104 +446,15 @@ class ModularSamplingProbabilisticConnector(VariableNumSamplesConnector):
 
     def _sample_connection_weights(self, counts, seed):
         return numpy.multiply(
-            self.parameters.base_weight.copy(seed).next(len(counts)),
+            _seeded_draw(self.parameters.base_weight, seed, len(counts)),
             counts
         )
 
 
     def _connect(self):
-        # Generates a splitted and of cells indices to be passed to each subprocesses
-        seeds = mozaik.get_model_seeds(len(self.target.pop))[numpy.nonzero(self.target.pop._mask_local)[0]]
-        splitted_seeds = numpy.array_split(seeds, int(self.model.num_threads))
-        splitted_cell_indices = numpy.array_split(
-            numpy.nonzero(self.target.pop._mask_local)[0], int(self.model.num_threads)
+        self._connect_by_sampling(
+            lambda index: self._obtain_num_samples(index, self.parameters.num_samples.next())
         )
-
-        # This code will be ran by each subprocess
-        import multiprocessing
-
-        def build_connector(indices, seeds, queue_cl, queue_v):
-            cli = []
-            vi = 0
-            for i in range(len(indices)):
-                weights = self._obtain_weights(indices[i],seeds[i])
-
-                # If a local module is defined, update the weights accordingly
-                if self.parameters.local_module:
-                    weights = self.local_module_weight_updates(indices[i], weights)
-
-                delays = self._obtain_delays(indices[i],seeds[i])
-
-                num_samples = self._obtain_num_samples(indices[i], self.parameters.num_samples.next())
-
-                co = Counter(
-                    sample_from_bin_distribution(
-                        weights, int(num_samples), seeds[i]
-                    )
-                )
-
-                vi = vi + numpy.sum(list(co.values()))
-                k = list(co.keys())
-                counts = list(co.values())
-                a = numpy.array(
-                    [
-                        k,
-                        numpy.zeros(len(k)) + indices[i],
-                        self.weight_scaler
-                        * self._sample_connection_weights(counts, seeds[i]),
-                        numpy.array(delays)[k],
-                    ]
-                )
-                cli.append(a)
-            # Add the output to the two queues to communicate it with the main process
-            queue_cl.put(cli)
-            queue_v.put(vi)
-
-        # Generate a list of subprocesses and of queues
-        processes = []
-        list_queue_cl = []
-        list_queue_v = []
-        for i in range(len(splitted_cell_indices)):
-            # Each queue will be used by the subprocesses to communicate with the main process
-            list_queue_cl.append(multiprocessing.Queue())
-            list_queue_v.append(multiprocessing.Queue())
-            proc = multiprocessing.Process(
-                target=build_connector,
-                args=(
-                    splitted_cell_indices[i],
-                    splitted_seeds[i],
-                    list_queue_cl[i],
-                    list_queue_v[i],
-                ),
-            )
-            proc.start()
-            processes.append(proc)
-
-        # Gather the output of each subprocesses
-        cl = []
-        v = 0
-        for i, p in enumerate(processes):
-            cli = list_queue_cl[i].get()
-            for clii in cli:
-                cl.append(clii)
-            v += list_queue_v[i].get()
-            p.join()
-
-        cl = numpy.hstack(cl).T
-        method = self.sim.FromListConnector(cl)
-        
-        logger.warning("%s(%s): %g connections were created, %g per target neuron [%g]" % (self.name,self.__class__.__name__,len(cl),len(cl)/len(numpy.nonzero(self.target.pop._mask_local)[0]),v/len(numpy.nonzero(self.target.pop._mask_local)[0])))
-	
-        if len(cl) > 0:
-            self.proj = self.sim.Projection(
-                                self.source.pop,
-                                self.target.pop,
-                                method,
-                                synapse_type=self.init_synaptic_mechanisms(),
-                                label=self.name,
-                                receptor_type=self.parameters.target_synapses)
-        else:
-            logger.warning("%s(%s): empty projection - pyNN projection not created." % (self.name,self.__class__.__name__))
 
 
 class LogNormalModularSamplingProbabilisticConnector(ModularSamplingProbabilisticConnector):
@@ -522,126 +573,27 @@ class ModularSamplingProbabilisticConnectorAnnotationSamplesCount(VariableNumSam
 
     def _sample_connection_weights(self, counts, seed):
         return numpy.multiply(
-            self.parameters.base_weight.copy(seed).next(len(counts)),
+            _seeded_draw(self.parameters.base_weight, seed, len(counts)),
             counts
         )
 
-    def _connect(self):
-        # Check if the delay function is incompatible with multiprocessing
-        cl = []
-        v = 0
-        # Generates a splitted and of cells indices to be passed to each subprocesses
-        seeds = mozaik.get_model_seeds(len(self.target.pop))[numpy.nonzero(self.target.pop._mask_local)[0]]
-
-        splitted_seeds = numpy.array_split(seeds, int(self.model.num_threads))
-        splitted_cell_indices = numpy.array_split(
-            numpy.nonzero(self.target.pop._mask_local)[0], int(self.model.num_threads)
+    def _num_samples(self, index):
+        samples = self.target.get_neuron_annotation(
+            index, self.parameters.annotation_reference_name
+        ) * self.parameters.samples_coeff
+        if self.parameters.num_samples == 0:
+            return self._obtain_num_samples(index, samples)
+        assert self.parameters.num_samples > 2 * int(
+            samples
+        ), "%s: %d %d" % (
+            self.name,
+            self.parameters.num_samples,
+            2 * int(samples),
         )
+        return self._obtain_num_samples(index, self.parameters.num_samples - 2 * int(samples))
 
-        import multiprocessing
-
-        # This code will be ran by each subprocess
-        def build_connector(indices, seeds, queue_cl, queue_v):
-            cli = []
-            vi = 0
-
-            for i in range(len(indices)):
-                samples = self.target.get_neuron_annotation(
-                    indices[i], self.parameters.annotation_reference_name
-                ) * self.parameters.samples_coeff
-                weights = self._obtain_weights(indices[i],seeds[i])
-                # If a local module is defined, update the weights accordingly
-                if self.parameters.local_module:
-                    weights = self.local_module_weight_updates(indices[i], weights)
-
-                delays = self._obtain_delays(indices[i],seeds[i])
-
-
-                if self.parameters.num_samples == 0:
-                    samples = self._obtain_num_samples(indices[i], samples)
-                    co = Counter(
-                        sample_from_bin_distribution(weights, int(samples), seeds[i])
-                    )
-
-                else:
-                    assert self.parameters.num_samples > 2 * int(
-                        samples
-                    ), "%s: %d %d" % (
-                        self.name,
-                        self.parameters.num_samples,
-                        2 * int(samples),
-                    )
-                    num_samples = self._obtain_num_samples(indices[i], self.parameters.num_samples - 2 * int(samples))
-                    co = Counter(
-                        sample_from_bin_distribution(
-                            weights,
-                            int(num_samples),
-                            seeds[i],
-                        )
-                    )
-
-                vi = vi + numpy.sum(list(co.values()))
-                k = list(co.keys())
-                counts = list(co.values())
-                a = numpy.array(
-                    [
-                        k,
-                        numpy.zeros(len(k)) + indices[i],
-                        self.weight_scaler
-                        * self._sample_connection_weights(counts, seeds[i]),
-                        numpy.array(delays)[k],
-                    ]
-                )
-                cli.append(a)
-            # Add the output to the two queues to communicate it with the main process
-            queue_cl.put(cli)
-            queue_v.put(vi)
-        
-        # Generate a list of subprocesses and of queues
-        processes = []
-        list_queue_cl = []
-        list_queue_v = []
-        for i in range(len(splitted_cell_indices)):
-            # Each queue will be used by the subprocesses to communicate with the main process
-            list_queue_cl.append(multiprocessing.Queue())
-            list_queue_v.append(multiprocessing.Queue())
-            proc = multiprocessing.Process(
-                target=build_connector,
-                args=(
-                    splitted_cell_indices[i],
-                    splitted_seeds[i],
-                    list_queue_cl[i],
-                    list_queue_v[i],
-                ),
-            )
-            proc.start()
-            processes.append(proc)
-
-        # Gather the output of each subprocesses
-        cl = []
-        v = 0
-        for i, p in enumerate(processes):
-            cli = list_queue_cl[i].get()
-            for clii in cli:
-                cl.append(clii)
-            v += list_queue_v[i].get()
-            p.join()
-
-        cl = numpy.hstack(cl).T
-        method = self.sim.FromListConnector(cl)
-        
-        logger.warning("%s(%s): %g connections were created, %g per target neuron [%g]" % (self.name,self.__class__.__name__,len(cl),len(cl)/len(numpy.nonzero(self.target.pop._mask_local)[0]),v/len(numpy.nonzero(self.target.pop._mask_local)[0])))
-        
-        if len(cl) > 0:
-            self.proj = self.sim.Projection(
-                                self.source.pop,
-                                self.target.pop,
-                                method,
-                                synapse_type=self.init_synaptic_mechanisms(),
-                                label=self.name,
-                                receptor_type=self.parameters.target_synapses)
-        else:
-            logger.warning("%s(%s): empty projection - pyNN projection not created." % (self.name,self.__class__.__name__))
+    def _connect(self):
+        self._connect_by_sampling(self._num_samples)
 
 
 class LogNormalModularSamplingProbabilisticConnectorAnnotationSamplesCount(

@@ -33,10 +33,43 @@ def sample_from_bin_distribution(bins, number_of_samples, seed):
         return []
 
     bins = bins / numpy.sum(bins)
-    random_generator = numpy.random.RandomState(seed=seed)
-    si = random_generator.choice(range(len(bins)), size=number_of_samples, p=bins)
+    if not numpy.all(bins >= 0):
+        raise ValueError("probabilities are not non-negative")
+    # This is exactly what numpy.random.RandomState(seed).choice(len(bins), number_of_samples, p=bins)
+    # does, but without the per-call cost of creating a RandomState and of converting range() to an array.
+    cdf = bins.cumsum()
+    cdf /= cdf[-1]
+    uniform_samples = seeded_random_state(seed).random_sample(number_of_samples)
+    return cdf.searchsorted(uniform_samples, side='right')
 
-    return si
+
+_seeded_random_state = None
+
+
+def seeded_random_state(seed):
+    r"""
+    Returns a numpy RandomState in the same state as numpy.random.RandomState(seed).
+
+    The returned object is shared and re-seeded at each call (which is much cheaper
+    than creating a new RandomState), so it has to be used before the next call.
+    """
+    global _seeded_random_state
+    if _seeded_random_state is None:
+        _seeded_random_state = numpy.random.RandomState(seed)
+    else:
+        _seeded_random_state.seed(seed)
+    return _seeded_random_state
+
+
+def counts_in_first_occurrence_order(samples):
+    r"""
+    Returns the distinct values in `samples` and the number of times each occurs,
+    both in order of first occurrence, i.e. the same as
+    list(Counter(samples).keys()), list(Counter(samples).values()).
+    """
+    values, first_index, counts = numpy.unique(samples, return_index=True, return_counts=True)
+    order = numpy.argsort(first_index, kind='stable')
+    return values[order], counts[order]
 
 
 _normal_function_sqertofpi = sqrt(2 * pi)

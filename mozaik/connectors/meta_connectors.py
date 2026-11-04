@@ -165,6 +165,44 @@ class GaborConnector(BaseComponent):
             phase_map = NearestNDInterpolator(list(zip(X.flatten(), Y.flatten()),
                                               phase_map.flatten()))
         
+        if not self._annotate_vectorized(target, parameters, or_map, phase_map):
+            self._annotate(target, parameters, or_map, phase_map)
+
+        ps = ParameterSet({   'target_synapses' : self.parameters.target_synapses,               
+                              'weight_functions' : {  'f1' : {
+                                                                 'component' : 'mozaik.connectors.vision.GaborArborization',
+                                                                 'params' : {
+                                                                                'ON' : True,
+                                                                                'gauss_coefficient': self.parameters.gauss_coefficient,
+                                                                            }
+                                                             }                                                                              
+                                                   },
+                             'delay_functions' : self.parameters.delay_functions,
+                             'num_samples_functions' : self.parameters.num_samples_functions,
+                             'weight_expression' : 'f1', # a python expression that can use variables f1..fn where n is the number of functions in weight_functions, and fi corresponds to the name given to a ModularConnectorFunction in weight_function ParameterSet. It determines how are the weight functions combined to obtain the weights
+                             'delay_expression' : self.parameters.delay_expression,
+                             'num_samples_expression' : self.parameters.num_samples_expression,
+                             'self_connections': False,
+                             'local_module' : self.parameters.local_module,
+                             'short_term_plasticity' : self.parameters.short_term_plasticity,
+                             'base_weight' : self.parameters.base_weight,
+                             'samples_coeff': 1,
+                             'num_samples' : 0,
+                             'annotation_reference_name' : 'aff_samples_increment',
+                          })
+                          
+        ModularSamplingProbabilisticConnectorAnnotationSamplesCount(network,name+'On',lgn_on,target,ps).connect()
+        ps['weight_functions.f1.params.ON']=False
+        ps['base_weight']=self.parameters.base_weight * self.parameters.off_bias
+        ModularSamplingProbabilisticConnectorAnnotationSamplesCount(network,name+'Off',lgn_off,target,ps).connect()
+           
+           
+           
+
+    def _annotate(self, target, parameters, or_map, phase_map):
+        r"""
+        Draws the afferent RF parameters of each target neuron and stores them as neuron annotations.
+        """
         for (j, neuron2) in enumerate(target.pop.all()):
             if or_map:
                 orientation = or_map(target.pop.positions[0][j],
@@ -197,8 +235,8 @@ class GaborConnector(BaseComponent):
             else:
                 target.add_neuron_annotation(j, 'aff_samples', increment_aff_samples, protected=False)
                 target.add_neuron_annotation(j, 'aff_samples_increment', increment_aff_samples, protected=False)
-            
-            
+        
+        
             if self.parameters.topological:
                 target.add_neuron_annotation(j, 'LGNAfferentX', target.pop.positions[0][j]+parameters.rf_jitter.next(), protected=True)
                 target.add_neuron_annotation(j, 'LGNAfferentY', target.pop.positions[1][j]+parameters.rf_jitter.next(), protected=True)
@@ -206,33 +244,76 @@ class GaborConnector(BaseComponent):
                 target.add_neuron_annotation(j, 'LGNAfferentX', parameters.rf_jitter.next(), protected=True)
                 target.add_neuron_annotation(j, 'LGNAfferentY', parameters.rf_jitter.next(), protected=True)
 
-        ps = ParameterSet({   'target_synapses' : self.parameters.target_synapses,               
-                              'weight_functions' : {  'f1' : {
-                                                                 'component' : 'mozaik.connectors.vision.GaborArborization',
-                                                                 'params' : {
-                                                                                'ON' : True,
-                                                                                'gauss_coefficient': self.parameters.gauss_coefficient,
-                                                                            }
-                                                             }                                                                              
-                                                   },
-                             'delay_functions' : self.parameters.delay_functions,
-                             'num_samples_functions' : self.parameters.num_samples_functions,
-                             'weight_expression' : 'f1', # a python expression that can use variables f1..fn where n is the number of functions in weight_functions, and fi corresponds to the name given to a ModularConnectorFunction in weight_function ParameterSet. It determines how are the weight functions combined to obtain the weights
-                             'delay_expression' : self.parameters.delay_expression,
-                             'num_samples_expression' : self.parameters.num_samples_expression,
-                             'self_connections': False,
-                             'local_module' : self.parameters.local_module,
-                             'short_term_plasticity' : self.parameters.short_term_plasticity,
-                             'base_weight' : self.parameters.base_weight,
-                             'samples_coeff': 1,
-                             'num_samples' : 0,
-                             'annotation_reference_name' : 'aff_samples_increment',
-                          })
-                          
-        ModularSamplingProbabilisticConnectorAnnotationSamplesCount(network,name+'On',lgn_on,target,ps).connect()
-        ps['weight_functions.f1.params.ON']=False
-        ps['base_weight']=self.parameters.base_weight * self.parameters.off_bias
-        ModularSamplingProbabilisticConnectorAnnotationSamplesCount(network,name+'Off',lgn_off,target,ps).connect()
-           
-           
-           
+    def _annotate_vectorized(self, target, parameters, or_map, phase_map):
+        r"""
+        Vectorized version of _annotate, producing exactly the same annotations (and leaving the
+        shared random number generator in the same state). The per neuron loop of _annotate draws,
+        for each neuron in turn, one value from each of the distributions listed below. When all of
+        them are uniform distributions drawing from the same numpy based rng, this is equivalent to
+        drawing one block of uniform numbers and splitting it into columns.
+
+        Returns False (without drawing anything) if that is not the case.
+        """
+        from pyNN.random import NumpyRNG
+        draws = []
+        if not or_map:
+            draws.append('orientation')
+        if not phase_map:
+            draws.append('phase')
+        draws += ['aspect_ratio', 'frequency', 'size', 'num_samples', 'rf_jitter_x', 'rf_jitter_y']
+        distributions = {
+            'orientation': parameters.orientation_preference,
+            'phase': parameters.phase,
+            'aspect_ratio': parameters.aspect_ratio,
+            'frequency': parameters.frequency,
+            'size': parameters.size,
+            'num_samples': self.parameters.num_samples,
+            'rf_jitter_x': parameters.rf_jitter,
+            'rf_jitter_y': parameters.rf_jitter,
+        }
+        dists = [distributions[d] for d in draws]
+        rng = dists[0].rng
+        if not (isinstance(rng, NumpyRNG) and all(isinstance(d, PyNNDistribution) and d.name == 'uniform' and d.rng is rng for d in dists)):
+            return False
+
+        n = len(target.pop)
+        u = rng.rng.random_sample(n * len(draws)).reshape(n, len(draws))
+        # RandomState.uniform(low, high) computes low + (high - low) * random_sample()
+        values = {d: dist.parameters['low'] + (dist.parameters['high'] - dist.parameters['low']) * u[:, k]
+                  for k, (d, dist) in enumerate(zip(draws, dists))}
+
+        positions_x = target.pop.positions[0]
+        positions_y = target.pop.positions[1]
+        if or_map:
+            orientation = [numpy.asarray(o) for o in or_map(positions_x, positions_y)]
+        else:
+            orientation = values['orientation']
+        if phase_map:
+            phase = [numpy.asarray(o) for o in phase_map(positions_x, positions_y)]
+        else:
+            phase = values['phase']
+
+        for j in range(n):
+            assert orientation[j] < numpy.pi
+
+            target.add_neuron_annotation(j, 'LGNAfferentOrientation', orientation[j], protected=True)
+            target.add_neuron_annotation(j, 'LGNAfferentAspectRatio', values['aspect_ratio'][j], protected=True)
+            target.add_neuron_annotation(j, 'LGNAfferentFrequency', values['frequency'][j], protected=True)
+            target.add_neuron_annotation(j, 'LGNAfferentSize', values['size'][j], protected=True)
+            target.add_neuron_annotation(j, 'LGNAfferentPhase', phase[j], protected=True)
+            increment_aff_samples = values['num_samples'][j]
+            if target.has_neuron_annotation(j, 'aff_samples'):
+                current_aff_samples = target.get_neuron_annotation(j, 'aff_samples')
+                target.add_neuron_annotation(j, 'aff_samples', increment_aff_samples + current_aff_samples, protected=False)
+                target.add_neuron_annotation(j, 'aff_samples_increment', increment_aff_samples, protected=False)
+            else:
+                target.add_neuron_annotation(j, 'aff_samples', increment_aff_samples, protected=False)
+                target.add_neuron_annotation(j, 'aff_samples_increment', increment_aff_samples, protected=False)
+
+            if self.parameters.topological:
+                target.add_neuron_annotation(j, 'LGNAfferentX', positions_x[j]+values['rf_jitter_x'][j], protected=True)
+                target.add_neuron_annotation(j, 'LGNAfferentY', positions_y[j]+values['rf_jitter_y'][j], protected=True)
+            else:
+                target.add_neuron_annotation(j, 'LGNAfferentX', values['rf_jitter_x'][j], protected=True)
+                target.add_neuron_annotation(j, 'LGNAfferentY', values['rf_jitter_y'][j], protected=True)
+        return True

@@ -64,6 +64,36 @@ class PyNNDistribution(RandomDistribution):
           new_rng = type(self.rng)(**params)
           return PyNNDistribution(name=self.name,rng=new_rng,**(self.parameters))
 
+      def is_constant(self):
+          r"""
+          True if the distribution always returns the same value (this is how mozaik
+          represents plain numbers given for PyNNDistribution parameters).
+          """
+          return self.name == 'uniform' and self.parameters['low'] == self.parameters['high']
+
+      def seeded_next(self, seed, n=None):
+          r"""
+          Returns the same values as self.copy(seed).next(n), without creating a new
+          random number generator at each call.
+          """
+          if self.is_constant() and numpy.isfinite(self.parameters['low']):
+              # low + (high - low) * U == low for any U
+              if n is None:
+                  return numpy.float64(self.parameters['low'])
+              return numpy.full(n, self.parameters['low'], dtype=numpy.float64)
+          if type(self.rng) is not NumpyRNG:
+              return self.copy(seed).next(n)
+          assert seed == int(seed), "Casting seed %d from %s to int, resulting in %d made seed different!" % (seed, type(seed), int(seed))
+          if getattr(self, '_seeded_copy', None) is None:
+              self._seeded_copy = self.copy(0)
+          rng = self._seeded_copy.rng
+          # Same seeding as NumpyRNG.__init__
+          rng.seed = int(seed)
+          if not rng.parallel_safe:
+              rng.seed += rng.mpi_rank
+          rng.rng.seed(rng.seed)
+          return self._seeded_copy.next(n)
+
 
 class ParameterWithUnitsAndPeriod():
     r"""

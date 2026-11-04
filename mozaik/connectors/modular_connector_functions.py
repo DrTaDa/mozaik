@@ -16,8 +16,15 @@ class ModularConnectorFunction(ParametrizedObject):
     
     Each instance has to implement the evaluate(u) function that returns the pre-synaptic weights
     of neuron i.
+
+    Functions that set `subset_evaluation_safe` to True guarantee that
+    evaluate_subset(index, source_indices, **params) returns the same values as
+    evaluate(index, **params)[source_indices] and that evaluating them does not draw
+    from any shared random number generator (so they can be evaluated in any order).
     """
-    
+
+    subset_evaluation_safe = False
+
     def __init__(self, source,target, parameters):
         ParametrizedObject.__init__(self, parameters)
         self.source = source
@@ -26,12 +33,20 @@ class ModularConnectorFunction(ParametrizedObject):
     def evaluate(self,index,**params):
         raise NotImplemented
 
+    def evaluate_subset(self,index,source_indices,**params):
+        return self.evaluate(index,**params)[source_indices]
+
 class ConstantModularConnectorFunction(ModularConnectorFunction):
       r"""
       Triavial modular connection function assigning each connections the same weight
       """
+      subset_evaluation_safe = True
+
       def evaluate(self,index,**params):
           return numpy.zeros(len(self.source.pop)) + 1
+
+      def evaluate_subset(self,index,source_indices,**params):
+          return numpy.zeros(len(source_indices)) + 1
 
 class PyNNDistributionConnectorFunction(ModularConnectorFunction):
       r"""
@@ -42,9 +57,12 @@ class PyNNDistributionConnectorFunction(ModularConnectorFunction):
         'pynn_distribution': PyNNDistribution,  # The distribution
       })
 
+      # only when evaluated with a seed, which is how the sampling connectors use it
+      subset_evaluation_safe = True
+
       def evaluate(self,index,seed=None):
           if seed is not None:
-              return self.parameters.pynn_distribution.copy(seed).next(len(self.source.pop))
+              return self.parameters.pynn_distribution.seeded_next(seed, len(self.source.pop))
           else:
               return self.parameters.pynn_distribution.next(len(self.source.pop))
 
@@ -69,6 +87,11 @@ class DistanceDependentModularConnectorFunction(ModularConnectorFunction):
         return self.distance_dependent_function(self.source.dvf_2_dcs(numpy.sqrt(
                                 numpy.power(self.source.pop.positions[0,:]-self.target.pop.positions[0,index],2) + numpy.power(self.source.pop.positions[1,:]-self.target.pop.positions[1,index],2)
                     )))
+
+    def evaluate_subset(self,index,source_indices,**params):
+        return self.distance_dependent_function(self.source.dvf_2_dcs(numpy.sqrt(
+                                numpy.power(self.source.pop.positions[0,source_indices]-self.target.pop.positions[0,index],2) + numpy.power(self.source.pop.positions[1,source_indices]-self.target.pop.positions[1,index],2)
+                    )))
         
         
 
@@ -77,6 +100,8 @@ class GaussianDecayModularConnectorFunction(DistanceDependentModularConnectorFun
     Distance dependent arborization with gaussian fall-off of the connections: k * exp(-0.5*(distance/a)*2) / (a*sqrt(2*pi))
     where a = arborization_constant, k = arborization_scaler
     """
+    subset_evaluation_safe = True
+
     required_parameters = ParameterSet({
         'arborization_constant': float,  # μm distance constant of the gaussian decay of the connections with respect (in cortical distance)
                                          # to the distance from the innervation point.
@@ -92,6 +117,8 @@ class ExponentialDecayModularConnectorFunction(DistanceDependentModularConnector
     r"""
     Distance dependent arborization with exponential fall-off of the connections: k * exp(-distance/a)
     """
+    subset_evaluation_safe = True
+
     required_parameters = ParameterSet({
         'arborization_constant': float,  # μm distance constant of the exponential decay of the connections with respect (in cortical distance)
                                          # to the distance from the innervation point.
@@ -107,6 +134,8 @@ class LinearModularConnectorFunction(DistanceDependentModularConnectorFunction):
     r"""
     Corresponds to: distance*linear_scaler + constant_scaler, where distance is in micrometers
     """
+    subset_evaluation_safe = True
+
     required_parameters = ParameterSet({
         'constant_scaler': float,    # the aditive constant of the decay
         'linear_scaler': float,    # the scaler of the linear decay
@@ -136,6 +165,8 @@ class HyperbolicModularConnectorFunction(DistanceDependentModularConnectorFuncti
     Stepanyants, A., Hirsch, J. a, Martinez, L. M., Kisvárday, Z. F., Ferecskó, A. S., & Chklovskii, D. B. (2008). 
     Local potential connectivity in cat primary visual cortex. Cerebral cortex, 18(1), 13–28. doi:10.1093/cercor/bhm027
     """
+    subset_evaluation_safe = True
+
     required_parameters = ParameterSet({
         'alpha' : float, # see description
         'theta': float,  # see description

@@ -241,9 +241,12 @@ class Sheet(BaseComponent):
                 self.to_record[var] = list(set(self.to_record.get(var,[])) | set(l))
 
 
+        idds = self.pop.all_cells.astype(int)
+        index_of = {}
+        for i, idd in enumerate(idds.tolist()):
+            index_of.setdefault(idd, i)
         for k in self.to_record.keys():
-            idds = self.pop.all_cells.astype(int)
-            self.to_record[k] = [numpy.flatnonzero(idds == idd)[0] for idd in self.to_record[k]]
+            self.to_record[k] = [index_of[idd] for idd in self.to_record[k]]
             
     def size_in_degrees(self):
         r"""Returns the x, y size in degrees of visual field of the given area."""
@@ -262,6 +265,12 @@ class Sheet(BaseComponent):
             if self._pop:
                 raise Exception("Error population has already been set. It is not allowed to do this twice!")
             self._pop = value
+            # pyNN stores these as ID objects. Comparing an ID with a numpy integer (as pyNN's
+            # id_to_index does for every recorded neuron when retrieving data) makes numpy look up
+            # array interface attributes on the ID, which pyNN resolves by querying the cell
+            # parameters from NEST - very slow. Plain integers behave identically otherwise.
+            value.first_id = int(value.first_id)
+            value.last_id = int(value.last_id)
             l = value.all_cells.astype(int)
             self._neuron_annotations = [OrderedDict() for i in range(0, len(value))]
             self.setup_artificial_stimulation()
@@ -448,7 +457,14 @@ class Sheet(BaseComponent):
         def key(a):
             return a.annotations['channel_id']
 
-        self.msc = numpy.mean([len(st)/(st.t_stop-st.t_start)*1000 for st in s.spiketrains])
+        # same values as numpy.mean([len(st)/(st.t_stop-st.t_start)*1000 for st in s.spiketrains]),
+        # without quantities arithmetic for every spike train
+        def rate(st):
+            if st.t_stop.dimensionality == st.t_start.dimensionality:
+                return len(st)/(float(st.t_stop)-float(st.t_start))*1000
+            return len(st)/(st.t_stop-st.t_start)*1000
+
+        self.msc = numpy.mean([rate(st) for st in s.spiketrains])
         s.spiketrains = sorted(s.spiketrains, key=key)
 
         if stimulus_duration != None:

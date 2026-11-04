@@ -260,6 +260,89 @@ class V1CorrelationBasedConnectivity(ModularConnectorFunction):
         #pylab.hist(self.source_size,bins=20)
 
         #self.flag=True
+
+        assert numpy.all(self.source_or >= 0) and numpy.all(self.source_or <= pi)
+        assert numpy.all(self.source_phase >= 0) and numpy.all(self.source_phase <= 2*pi)
+        self._precompute_source_terms()
+
+    def _precompute_source_terms(self):
+        r"""
+        Precomputes all the terms of gabor_correlation_rescaled_parammeters that only depend
+        on the source neurons (they are the same for every target neuron). The expressions
+        are exactly those of gabor_correlation_rescaled_parammeters, gabor_correlation and
+        integral_of_gabor_multiplication_vectorized, so the results are identical.
+        """
+        width1, posx1, posy1, ar1, or1, freq1, phase1 = (self.source_size, self.source_posx, self.source_posy,
+                                                         self.source_ar, self.source_or, self.source_freq, self.source_phase)
+        K1 = 1.0
+        widthx1 = 1/(numpy.sqrt(2*numpy.pi)*width1)
+        widthy1 = ar1/(numpy.sqrt(2*numpy.pi)*width1)
+        gauss_or1 = or1
+        sine_orientation1 = or1
+        phase1 = phase1-numpy.pi*2*freq1*(posx1*numpy.cos(or1)+posy1*numpy.sin(or1))
+
+        Omega1a,Omega1b,Omega1c,Omega1d = V1CorrelationBasedConnectivity.omega(widthx1,widthy1,gauss_or1)
+        self._s = dict(
+            K1=K1, posx1=posx1, posy1=posy1, phase1=phase1,
+            Omega1a=Omega1a, Omega1b=Omega1b, Omega1c=Omega1c, Omega1d=Omega1d,
+            _x1=Omega1a*posx1+Omega1b*posy1, _y1=Omega1c*posx1+Omega1d*posy1,
+            ux1=freq1 * numpy.cos(sine_orientation1), uy1=freq1 * numpy.sin(sine_orientation1),
+            q1=Omega1a*posx1*posx1+Omega1b*posy1*posx1 + Omega1c*posx1*posy1+Omega1d*posy1*posy1,
+        )
+        self._source_var = V1CorrelationBasedConnectivity.integral_of_gabor_multiplication_vectorized(
+                                    K1,widthx1,widthy1,posx1,posy1,gauss_or1,freq1,sine_orientation1,phase1,
+                                    K1,widthx1,widthy1,posx1,posy1,gauss_or1,freq1,sine_orientation1,phase1)
+
+    def _correlation_with_sources(self,width2,posx2,posy2,ar2,or2,freq2,phase2):
+        r"""
+        Same as gabor_correlation_rescaled_parammeters(<source arrays>, <target values>), using the
+        precomputed source terms.
+        """
+        s = self._s
+        K2 = 1.0
+        widthx2 = 1/(numpy.sqrt(2*numpy.pi)*width2)
+        widthy2 = ar2/(numpy.sqrt(2*numpy.pi)*width2)
+        gauss_or2 = or2
+        sine_orientation2 = or2
+        phase2 = phase2-numpy.pi*2*freq2*(posx2*numpy.cos(or2)+posy2*numpy.sin(or2))
+
+        # integral_of_gabor_multiplication_vectorized(source, target)
+        Omega2a,Omega2b,Omega2c,Omega2d = V1CorrelationBasedConnectivity.omega(widthx2,widthy2,gauss_or2)
+        OmegaSa = s['Omega1a'] + Omega2a
+        OmegaSb = s['Omega1b'] + Omega2b
+        OmegaSc = s['Omega1c'] + Omega2c
+        OmegaSd = s['Omega1d'] + Omega2d
+
+        det = OmegaSa*OmegaSd - OmegaSb*OmegaSc
+        z = 1 / det
+        OmegaSInva = z * OmegaSd
+        OmegaSInvb = -z * OmegaSb
+        OmegaSInvc = -z * OmegaSc
+        OmegaSInvd = z * OmegaSa
+
+        _x2,_y2 = (Omega2a*posx2+Omega2b*posy2, Omega2c*posx2+Omega2d*posy2)
+        _x = s['_x1']+_x2
+        _y = s['_y1']+_y2
+        xs1,xs2 = (OmegaSInva*_x+OmegaSInvb*_y, OmegaSInvc*_x+OmegaSInvd*_y)
+
+        ux2 = freq2 * numpy.cos(sine_orientation2)
+        uy2 = freq2 * numpy.sin(sine_orientation2)
+
+        q2 = Omega2a*posx2*posx2+Omega2b*posy2*posx2 + Omega2c*posx2*posy2+Omega2d*posy2*posy2
+        qS = OmegaSa*xs1*xs1+OmegaSb*xs2*xs1 + OmegaSc*xs1*xs2+OmegaSd*xs2*xs2
+        K_s = s['K1']*K2*numpy.exp(-numpy.pi*(s['q1'] + q2 - qS))
+        K_s_norm = K_s/numpy.sqrt(det)
+
+        def real_integral_complex_gabors(ux,uy, P_s):
+            # numpy.real(K*numpy.exp(1j*2*numpy.pi*X+1j*P_s)) for real K, computed without complex
+            # arithmetic (K*cos(2*pi*X+P_s) evaluates to the same floating point values).
+            return K_s_norm*numpy.exp(-numpy.pi*(OmegaSInva*ux*ux+OmegaSInvb*uy*ux + OmegaSInvc*ux*uy+OmegaSInvd*uy*uy))*numpy.cos(2*numpy.pi*(ux*xs1+uy*xs2)+P_s)
+
+        cov = 1./2*(real_integral_complex_gabors(s['ux1']-ux2,s['uy1']-uy2, s['phase1']-phase2)+ real_integral_complex_gabors(s['ux1']+ux2,s['uy1']+uy2, s['phase1']+phase2))
+
+        var2 = V1CorrelationBasedConnectivity.integral_of_gabor_multiplication_vectorized(K2,widthx2,widthy2,posx2,posy2,gauss_or2,freq2,sine_orientation2,phase2,
+                                                               K2,widthx2,widthy2,posx2,posy2,gauss_or2,freq2,sine_orientation2,phase2)
+        return numpy.array(cov/(numpy.sqrt(self._source_var)*numpy.sqrt(var2)))
     
     
     @staticmethod
@@ -369,13 +452,10 @@ class V1CorrelationBasedConnectivity(ModularConnectorFunction):
         target_posx = self.target.get_neuron_annotation(index, 'LGNAfferentX')
         target_posy = self.target.get_neuron_annotation(index, 'LGNAfferentY')
         
-        assert numpy.all(self.source_or >= 0) and numpy.all(self.source_or <= pi)
         assert numpy.all(target_or >= 0) and numpy.all(target_or <= pi)
-        assert numpy.all(self.source_phase >= 0) and numpy.all(self.source_phase <= 2*pi)
         assert numpy.all(target_phase >= 0) and numpy.all(target_phase <= 2*pi)
         
-        corr = V1CorrelationBasedConnectivity.gabor_correlation_rescaled_parammeters(self.source_size,self.source_posx,self.source_posy,self.source_ar,self.source_or,self.source_freq,self.source_phase,
-                                                                                     target_size,target_posx,target_posy,target_ar,target_or,target_freq,target_phase)
+        corr = self._correlation_with_sources(target_size,target_posx,target_posy,target_ar,target_or,target_freq,target_phase)
                                                                                      
         assert numpy.all(corr >= -1.0) and numpy.all(corr <= 1.000001), ("The correlation is %f %f" % (numpy.min(corr),numpy.max(corr)))
         

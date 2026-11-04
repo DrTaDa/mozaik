@@ -480,6 +480,71 @@ class CellWithReceptiveField(object):
         return {"times": time_points, "amplitudes": response}
 
 
+def _same_filter_state(a, b):
+    r"""
+    True if the two filter states (KernelResponse or None) are identical.
+    """
+    if a is b:
+        return True
+    if a is None or b is None:
+        return False
+    return numpy.array_equal(a.contrast, b.contrast) and numpy.array_equal(
+        a.luminance, b.luminance
+    )
+
+
+def _set_cell_parameters(sim, cells, params):
+    r"""
+    Sets native NEST parameters of individual cells, with the same effect as calling
+    ``cell.set_parameters(**param)`` for each cell, but with a single NEST call.
+
+    Parameters
+    ----------
+    sim : module
+        The pyNN.nest module.
+
+    cells : list of int
+        NEST node ids of the cells.
+
+    params : list of dict
+        Parameter dictionary for each cell. Array values are numpy arrays.
+    """
+    import nest
+    from pyNN.nest.simulator import NEST_VARIABLES_TIME_DIMENSION, NEST_ARRAY_VARIABLES_TIME_DIMENSION
+
+    offset = sim.simulator.state._time_offset
+
+    def native(param):
+        # as pyNN: arrays are passed as lists, times are shifted by the simulator time offset
+        d = {}
+        for name, value in param.items():
+            if isinstance(value, numpy.ndarray):
+                value = value.tolist()
+            if offset != 0.0:
+                if name in NEST_VARIABLES_TIME_DIMENSION:
+                    value = value + offset
+                elif name in NEST_ARRAY_VARIABLES_TIME_DIMENSION:
+                    value = [v + offset for v in value]
+            d[name] = value
+        return d
+
+    if len(cells) == 0:
+        return
+    if any(b <= a for a, b in zip(cells[:-1], cells[1:])):
+        # a NodeCollection needs sorted unique ids
+        for cell, param in zip(cells, params):
+            nest.SetStatus(nest.NodeCollection([cell]), native(param))
+        return
+    if all(param is params[0] for param in params):
+        nest.SetStatus(nest.NodeCollection(cells), native(params[0]))
+        return
+    converted = {}
+    for param in params:
+        if id(param) not in converted:
+            converted[id(param)] = native(param)
+    nest.SetStatus(nest.NodeCollection(cells), [converted[id(param)] for param in params])
+
+
 class SpatioTemporalFilterRetinaLGN(SensoryInputComponent):
     r"""
     Retinothalamic preprocessing with spatiotemporal receptive fields feeding
@@ -795,15 +860,21 @@ class SpatioTemporalFilterRetinaLGN(SensoryInputComponent):
         for rf_type in self.rf_types:
             assert isinstance(input_currents[rf_type], list)
             if self.integrated_cs:
+                cells = []
+                params = []
+                last_current = None
                 for i, (lgn_cell, input_current) in enumerate(
                     zip(self.sheets[rf_type].pop, input_currents[rf_type])
                 ):
                     assert isinstance(input_current, dict)
-                    t = input_current["times"] + offset
-                    a = self.parameters.linear_scaler * input_current["amplitudes"]
-                    lgn_cell.set_parameters(
-                        amplitude_times=t[1:], amplitude_values=a[1:] * 1000
-                    )
+                    if input_current is not last_current:
+                        last_current = input_current
+                        t = input_current["times"] + offset
+                        a = self.parameters.linear_scaler * input_current["amplitudes"]
+                        param = {"amplitude_times": t[1:], "amplitude_values": a[1:] * 1000}
+                    cells.append(int(lgn_cell))
+                    params.append(param)
+                _set_cell_parameters(self.model.sim, cells, params)
 
             else:
                 for i, (lgn_cell, input_current, scs, ncs) in enumerate(
@@ -857,11 +928,12 @@ class SpatioTemporalFilterRetinaLGN(SensoryInputComponent):
             )
 
             if self.integrated_cs:
-                for lgn_cell in self.sheets[rf_type].pop:
-                    lgn_cell.set_parameters(
-                        amplitude_times=times,
-                        amplitude_values=numpy.zeros_like(times) + amplitude * 1000,
-                    )
+                param = {
+                    "amplitude_times": times,
+                    "amplitude_values": numpy.zeros_like(times) + amplitude * 1000,
+                }
+                cells = [int(lgn_cell) for lgn_cell in self.sheets[rf_type].pop]
+                _set_cell_parameters(self.model.sim, cells, [param] * len(cells))
             else:
                 for i, (scs, ncs) in enumerate(
                     zip(self.scs[rf_type], self.ncs[rf_type])
@@ -906,7 +978,21 @@ class SpatioTemporalFilterRetinaLGN(SensoryInputComponent):
         input_currents = OrderedDict()
         for rf_type in self.rf_types:
             input_currents[rf_type] = []
+            # The null response of a cell only depends on its receptive field (shared by all cells
+            # of a given type), the visual space and its filter state. Cells whose filter state is
+            # identical to that of the previously computed cell reuse its result.
+            previous = None
+            previous_initial_state = None
             for cell in self.input_cells[rf_type]:
+                if previous is not None and _same_filter_state(cell.filter_state, previous_initial_state):
+                    cell.response_length = previous.response_length
+                    cell.i = previous.i
+                    cell.kernel_response = previous.kernel_response
+                    cell.filter_state = previous.filter_state
+                    input_currents[rf_type].append(input_currents[rf_type][-1])
+                    continue
+                previous = cell
+                previous_initial_state = cell.filter_state
                 num_frames = (
                     int(numpy.ceil(duration / cell.visual_space.update_interval))
                     * cell.update_factor
